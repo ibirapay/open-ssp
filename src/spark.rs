@@ -18,7 +18,7 @@ use ::spark::{
     },
     operator::{rpc::DefaultConnectionManager, OperatorPool},
     services::{
-        LeafKeyTweak, LeafSplitDraft, LeafSplitPlan, LeafSplitService, SubmittedLeafSplit,
+        LeafSplitDraft, LeafSplitPlan, LeafSplitService, SubmittedLeafSplit,
         Transfer as SparkTransfer, TransferService, TransferType,
     },
     session_store::InMemorySessionStore,
@@ -213,9 +213,27 @@ impl SparkService {
         let mnemonic =
             load_or_create_mnemonic(&config.spark_mnemonic_file, config.spark_mnemonic_required)?;
         let seed = mnemonic.to_seed("");
-        let signer = Arc::new(DefaultSigner::new(&seed, network).map_err(|e| e.to_string())?);
+        let account = spark_account_number(network, config.spark_account_number);
+        // Deposit claims and leaf splits commit to a nonce before signing, possibly
+        // across a restart: keep those nonces on disk, still signable only once.
+        let nonces = Arc::new(
+            ::spark::signer::NonceStore::durable(
+                std::path::Path::new(&config.data_dir).join("frost-nonces"),
+            )
+            .map_err(|e| e.to_string())?,
+        );
+        let master = ::spark::signer::account_master_key(&seed, network, Some(account))
+            .map_err(|e| e.to_string())?;
+        let signer = Arc::new(DefaultSigner::with_nonce_store(master, nonces));
         let raw_signer = signer.clone();
-        let identity_secret = ::spark::signer::identity_master_key(&seed, network, None)
+        let dropped = crate::static_deposits::check_legacy_nonces(&db).await?;
+        if dropped > 0 {
+            tracing::info!(
+                dropped,
+                "dropped legacy nonce ciphertexts of signed deposit claims"
+            );
+        }
+        let identity_secret = ::spark::signer::identity_master_key(&seed, network, Some(account))
             .map_err(|e| e.to_string())?
             .private_key;
         let signer: Arc<dyn CoreSparkSigner> =
@@ -309,6 +327,7 @@ impl SparkService {
             wallet_config.split_secret_threshold,
             operator_pool.clone(),
             None,
+            wallet_config.fee_ladder_enabled,
         ));
 
         let ssp_hosts = csv(&config.ssp_operator_hosts);
@@ -628,13 +647,7 @@ impl SparkService {
             .collect::<Result<Vec<_>, _>>()?;
         let selected =
             select_leaves_by_exact_amounts(&leaves, &[quote.credit]).map_err(|e| e.to_string())?;
-        let tweaks = selected
-            .into_iter()
-            .map(|node| LeafKeyTweak {
-                node,
-                incoming_key: None,
-            })
-            .collect::<Vec<_>>();
+        let tweaks = ::spark::utils::leaf_key_tweak::with_node_id_keys(selected);
         let owner = spark_wallet::PublicKey::from_str(&quote.owner).map_err(|e| e.to_string())?;
         let id = TransferId::from_str(transfer_id)?;
         let prepared = self
@@ -669,7 +682,6 @@ impl SparkService {
                 raw_tx: bitcoin::consensus::serialize(spend),
                 signing_nonce_commitment: Some(
                     nonce
-                        .commitments
                         .try_into()
                         .map_err(|e: ::spark::services::ServiceError| e.to_string())?,
                 ),
@@ -679,7 +691,6 @@ impl SparkService {
         };
         Ok(crate::static_deposits::StaticPlan {
             request: req.encode_to_vec(),
-            nonce_ciphertext: nonce.nonces_ciphertext,
             encrypted_key: hex::decode(encrypted).map_err(|e| e.to_string())?,
             prev_output: quote.prev_output.clone(),
         })
@@ -695,10 +706,7 @@ impl SparkService {
         use ::spark::{
             operator::rpc::spark_ssp_internal::StaticDepositSwapRequest,
             services::SigningResult,
-            signer::{
-                AggregateFrostRequest, FrostSigningCommitmentsWithNonces, SecretSource,
-                SignFrostRequest, Signer,
-            },
+            signer::{AggregateFrostRequest, SecretSource, SignFrostRequest, Signer},
         };
         use prost::Message;
         let req =
@@ -753,14 +761,12 @@ impl SparkService {
         let mut spend: Transaction = deserialize(&job.raw_tx).map_err(|e| e.to_string())?;
         let sighash =
             ::spark::bitcoin::sighash_from_tx(&spend, 0, &prev).map_err(|e| e.to_string())?;
-        let nonce = FrostSigningCommitmentsWithNonces {
-            commitments: job
-                .signing_nonce_commitment
-                .ok_or("missing deposit nonce")?
-                .try_into()
-                .map_err(|e: ::spark::services::ServiceError| e.to_string())?,
-            nonces_ciphertext: plan.nonce_ciphertext.clone(),
-        };
+        // The signer holds the secret nonce behind this commitment and consumes it.
+        let nonce = job
+            .signing_nonce_commitment
+            .ok_or("missing deposit nonce")?
+            .try_into()
+            .map_err(|e: ::spark::services::ServiceError| e.to_string())?;
         let key = SecretSource::new_encrypted(plan.encrypted_key.clone());
         let user_share = self
             .raw_signer
@@ -781,7 +787,7 @@ impl SparkService {
             statechain_public_keys: result.public_keys,
             verifying_key: &verifying_key,
             statechain_commitments: result.signing_commitments,
-            self_commitment: &nonce.commitments,
+            self_commitment: &nonce,
             public_key: &signing_key,
             self_signature: &user_share,
             adaptor_public_key: None,
@@ -1051,13 +1057,7 @@ impl SparkService {
             leaf_count = selected.len(),
             "selected Spark liquidity for Lightning receive"
         );
-        let leaf_tweaks = selected
-            .into_iter()
-            .map(|node| LeafKeyTweak {
-                node,
-                incoming_key: None,
-            })
-            .collect::<Vec<_>>();
+        let leaf_tweaks = ::spark::utils::leaf_key_tweak::with_node_id_keys(selected);
         let expiry = std::time::SystemTime::now() + Duration::from_secs(30 * 60);
         let prepared = self
             .transfer_service
@@ -1757,7 +1757,6 @@ fn build_lightning_receive_swap_request(
             }),
         }),
         reason: PreimageSwapReason::Receive as i32,
-        transfer: None,
         receiver_identity_public_key: receiver.serialize().to_vec(),
         fee_sats,
         transfer_request: Some(transfer_request),
@@ -2135,6 +2134,17 @@ fn validate_swap_primary_claimable(status: &TransferStatus) -> Result<(), String
     }
 }
 
+/// The account the SSP's Spark keys derive under: the configured one, else the
+/// SDK's historical default (regtest 0, every other network 1). Pinned because
+/// the SDK moved its Signet/Testnet default to 0, which would derive a different
+/// identity and different leaf keys from the same mnemonic.
+fn spark_account_number(network: Network, configured: Option<u32>) -> u32 {
+    configured.unwrap_or(match network {
+        Network::Regtest => 0,
+        _ => 1,
+    })
+}
+
 fn parse_network(value: &str) -> Result<Network, String> {
     match value.to_ascii_uppercase().as_str() {
         "MAINNET" => Ok(Network::Mainnet),
@@ -2282,6 +2292,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spark_keys_stay_on_the_historical_account() {
+        for network in [Network::Mainnet, Network::Signet, Network::Testnet] {
+            assert_eq!(spark_account_number(network, None), 1);
+        }
+        assert_eq!(spark_account_number(Network::Regtest, None), 0);
+        assert_eq!(spark_account_number(Network::Signet, Some(7)), 7);
+        // The SDK's own Signet default no longer gives the identity the SSP has.
+        let seed = [7u8; 64];
+        let pinned = ::spark::signer::identity_master_key(
+            &seed,
+            Network::Signet,
+            Some(spark_account_number(Network::Signet, None)),
+        )
+        .unwrap();
+        let sdk_default =
+            ::spark::signer::identity_master_key(&seed, Network::Signet, None).unwrap();
+        assert_ne!(pinned.private_key, sdk_default.private_key);
+    }
+
     use super::*;
 
     #[test]
@@ -2370,7 +2400,6 @@ mod tests {
         assert_eq!(request.reason, PreimageSwapReason::Receive as i32);
         assert_eq!(request.payment_hash, payment_hash.to_byte_array());
         assert_eq!(request.receiver_identity_public_key, receiver.serialize());
-        assert!(request.transfer.is_none());
         assert_eq!(request.fee_sats, 0);
         let amount = request.invoice_amount.unwrap();
         assert_eq!(amount.value_sats, 5_000);

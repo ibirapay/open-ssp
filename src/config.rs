@@ -42,6 +42,9 @@ pub struct Config {
     /// Refuse to create a new mnemonic when the configured file is absent.
     /// Production enables this to prevent an accidental identity change.
     pub spark_mnemonic_required: bool,
+    /// BIP32 account the Spark keys derive under. Unset keeps the account the
+    /// SSP has always used, whatever the SDK's default for the network.
+    pub spark_account_number: Option<u32>,
     /// Custom operator endpoints and identities, in the same order.
     pub so_hosts: String,
     pub so_identity_pubkeys: String,
@@ -127,6 +130,14 @@ impl Config {
                     .as_str(),
                 "1" | "true" | "yes"
             ),
+            spark_account_number: match get("SSP_ACCOUNT_NUMBER", "").as_str() {
+                "" => None,
+                value => Some(
+                    value
+                        .parse()
+                        .map_err(|e| format!("SSP_ACCOUNT_NUMBER: {e}"))?,
+                ),
+            },
             so_hosts: get("SO_HOSTS", ""),
             so_identity_pubkeys: get("SO_IDENTITY_PUBKEYS", ""),
             so_cert_files: get("SO_CERT_FILES", ""),

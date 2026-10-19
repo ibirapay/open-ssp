@@ -31,7 +31,6 @@ pub struct DepositQuote {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StaticPlan {
     pub request: Vec<u8>,
-    pub nonce_ciphertext: Vec<u8>,
     pub encrypted_key: Vec<u8>,
     pub prev_output: String,
 }
@@ -411,6 +410,46 @@ impl StaticDepositService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_nonces_are_dropped_when_signed_and_block_startup_when_not() {
+        let dir = std::env::temp_dir().join(format!("open-ssp-legacy-{}", uuid::Uuid::new_v4()));
+        let db = crate::db::Db::open(dir.to_str().unwrap()).unwrap();
+        let insert = |id: &'static str, txid: &'static str, data: Value| {
+            let data = data.to_string();
+            db.with(move |c| {
+                c.execute(
+                    "INSERT INTO deposit_claims(id,txid,vout,owner,status,data) VALUES(?1,?2,0,'o','PENDING',?3)",
+                    (id, txid, &data),
+                )
+            })
+        };
+        let plan = |ciphertext: Vec<u8>| json!({"request":[1],"nonce_ciphertext":ciphertext,"encrypted_key":[],"prev_output":""});
+
+        insert(
+            "signed",
+            "aa",
+            json!({"plan":plan(vec![9]),"signed_spend":"00"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(check_legacy_nonces(&db).await.unwrap(), 1);
+        let left: Option<String> = db
+            .with(|c| c.query_row("SELECT json_extract(data,'$.plan.nonce_ciphertext') FROM deposit_claims WHERE id='signed'", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(left, None, "a signed claim keeps no legacy nonce");
+
+        insert(
+            "unsigned",
+            "bb",
+            json!({"plan":plan(vec![7]),"signed_spend":null}),
+        )
+        .await
+        .unwrap();
+        let err = check_legacy_nonces(&db).await.unwrap_err();
+        assert!(err.contains("deposit_claims unsigned"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
     #[test]
     fn recovery_matches_operator_template_and_default_client_fee_cap() {
         let destination = ScriptBuf::from_bytes([vec![0, 20], vec![1; 20]].concat());
@@ -444,4 +483,53 @@ mod tests {
         }
         assert!(outpoint(&json!({"transaction_id":"garbage","output_index":0})).is_err());
     }
+}
+
+/// Plans written before nonces moved into the signer carry the deposit nonce
+/// encrypted to the signer (`plan.nonce_ciphertext`). Such a nonce cannot be
+/// trusted to be unused, so it is never brought back: a signed claim only has the
+/// stale ciphertext dropped, and an unsigned one stops startup, to be finished on
+/// the previous version first.
+pub(crate) async fn check_legacy_nonces(db: &crate::db::Db) -> Result<usize, String> {
+    let mut dropped = 0;
+    let mut unsigned = Vec::new();
+    for table in ["deposit_claims", "instant_claims"] {
+        let rows: Vec<(String, String)> = db
+            .with(|c| {
+                let mut s = c.prepare(&format!(
+                    "SELECT id,data FROM {table} \
+                     WHERE json_array_length(data,'$.plan.nonce_ciphertext')>0"
+                ))?;
+                let rows = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect()
+            })
+            .await?;
+        for (id, data) in rows {
+            let mut data: Value = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+            if data.get("signed_spend").is_none_or(Value::is_null) {
+                unsigned.push(format!("{table} {id}"));
+                continue;
+            }
+            if let Some(plan) = data.get_mut("plan").and_then(Value::as_object_mut) {
+                plan.remove("nonce_ciphertext");
+            }
+            let data = data.to_string();
+            db.with(|c| {
+                c.execute(
+                    &format!("UPDATE {table} SET data=?2 WHERE id=?1"),
+                    (&id, &data),
+                )
+            })
+            .await?;
+            dropped += 1;
+        }
+    }
+    if !unsigned.is_empty() {
+        return Err(format!(
+            "unsigned deposit claims from the previous nonce design: {}. Finish them on the \
+             previous version before upgrading",
+            unsigned.join(", ")
+        ));
+    }
+    Ok(dropped)
 }

@@ -1244,7 +1244,10 @@ async fn static_deposit(client: &Client, config: &TestConfig, wallet: &Wallet) -
             })
             .await?;
         ensure!(
-            claimed.payment.is_some(),
+            matches!(
+                claimed.outcome,
+                breez_sdk_spark::ClaimDepositOutcome::Settled { .. }
+            ),
             "confirmed deposit used the instant claim path"
         );
         Ok(())

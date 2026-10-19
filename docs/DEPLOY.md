@@ -26,6 +26,7 @@ The SSP calls existing operator consensus code through this RPC.
 | `SSP_DATA_DIR` | SQLite directory; use persistent storage |
 | `SPARK_MNEMONIC_FILE` | Persistent BIP39 mnemonic path |
 | `SPARK_MNEMONIC_REQUIRED` | Set to `1` after the wallet file exists |
+| `SSP_ACCOUNT_NUMBER` | BIP32 account of the Spark keys; unset keeps regtest 0 and every other network 1 (the SSP identity and leaf keys depend on it) |
 | `SSP_IDENTITY_PUBKEY` | Optional guard for the identity derived from the mnemonic |
 | `SO_HOSTS` | Ordered, comma-separated operator gRPC addresses |
 | `SO_IDENTITY_PUBKEYS` | Ordered operator identity keys; must match `SO_HOSTS` |

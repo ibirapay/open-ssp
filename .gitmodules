@@ -7,4 +7,5 @@
 	url = https://github.com/lightningdevkit/ldk-server.git
 [submodule "vendor/breez-sdk"]
 	path = vendor/breez-sdk
-	url = https://github.com/benthecarman/spark-sdk
+	url = https://github.com/ibirapay/spark-sdk
+	branch = ibirapay-journal

@@ -213,7 +213,20 @@ impl SparkService {
         let mnemonic =
             load_or_create_mnemonic(&config.spark_mnemonic_file, config.spark_mnemonic_required)?;
         let seed = mnemonic.to_seed("");
-        let signer = Arc::new(DefaultSigner::new(&seed, network).map_err(|e| e.to_string())?);
+        // The SSP persists prepared commitments (deposit claims, leaf splits) and
+        // may sign them again after a restart: the journal lets each commitment
+        // release one share, for one request.
+        let journal = Arc::new(
+            ::spark::signer::SignJournal::open(
+                std::path::Path::new(&config.data_dir).join("frost-journal"),
+            )
+            .map_err(|e| e.to_string())?,
+        );
+        let signer = Arc::new(
+            DefaultSigner::new(&seed, network)
+                .map_err(|e| e.to_string())?
+                .with_sign_journal(journal),
+        );
         let raw_signer = signer.clone();
         let identity_secret = ::spark::signer::identity_master_key(&seed, network, None)
             .map_err(|e| e.to_string())?

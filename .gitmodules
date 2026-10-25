@@ -1,7 +1,7 @@
 [submodule "vendor/spark"]
 	path = vendor/spark
 	url = https://github.com/ibirapay/spark.git
-	branch = sp-4089
+	branch = main
 [submodule "vendor/ldk-server"]
 	path = vendor/ldk-server
 	url = https://github.com/lightningdevkit/ldk-server.git

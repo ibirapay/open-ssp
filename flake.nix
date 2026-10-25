@@ -5,6 +5,8 @@
   #   nix build .#ldk-server-oci local/ldk-server:<rev>      (ldk-server + ldk-server-cli)
   #   nix build .#oci            local/open-ssp:<rev>
   #   nix build .#caddy-oci      local/spark-caddy:<rev>     (TLS front for the SSP, static certs, no ACME)
+  #   nix build .#postgres-oci   local/spark-postgres:<rev>  (operator DBs)
+  #   nix build .#lego-oci       local/spark-lego:<rev>      (ACME DNS-01 for the operator + SSP certs)
   # From a git checkout the submodules must be inside the flake source: `nix build '.?submodules=1#oci'`.
   # The deploy builds from a `git archive` tree (each submodule archived at its pin) plus a REV file.
   description = "IBIRAPAY Spark operators + SSP";
@@ -89,6 +91,22 @@
       };
 
       certs = "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+
+      # initdb on an empty data dir (superuser password from a mounted file), then postgres. Network clients
+      # (internal compose network only) use scram; the local socket uses peer auth, so admin SQL runs through
+      # `docker exec` with no password anywhere. postgres needs a passwd entry for its uid: the deploy mounts one.
+      postgresEntry = pkgs.writeShellScript "spark-postgres-entry" ''
+        set -eu
+        export PATH=${pkgs.postgresql_16}/bin:${pkgs.coreutils}/bin
+        data=/var/lib/postgresql/data
+        if [ ! -s "$data/PG_VERSION" ]; then
+          initdb -D "$data" -U postgres --auth-local=peer --auth-host=scram-sha-256 \
+            --pwfile=/run/secrets/pg-superuser
+          echo "host all all all scram-sha-256" >> "$data/pg_hba.conf"
+        fi
+        exec postgres -D "$data" -c listen_addresses='*' -c unix_socket_directories=/tmp \
+          -c password_encryption=scram-sha-256
+      '';
     in
     {
       packages.${system} = {
@@ -123,6 +141,26 @@
           config = {
             Entrypoint = [ "/bin/open-ssp" ];
             Env = [ certs "SSP_DATA_DIR=/data" ];
+          };
+        };
+
+        postgres-oci = pkgs.dockerTools.buildLayeredImage {
+          name = "local/spark-postgres";
+          inherit tag;
+          contents = [ pkgs.postgresql_16 pkgs.coreutils pkgs.bash ]; # initdb popen()s /bin/sh
+          config = {
+            Entrypoint = [ "${postgresEntry}" ];
+            Env = [ "PGDATA=/var/lib/postgresql/data" ];
+          };
+        };
+
+        lego-oci = pkgs.dockerTools.buildLayeredImage {
+          name = "local/spark-lego";
+          inherit tag;
+          contents = [ pkgs.lego pkgs.cacert ];
+          config = {
+            Entrypoint = [ "/bin/lego" ];
+            Env = [ certs ];
           };
         };
 

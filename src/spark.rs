@@ -2168,6 +2168,19 @@ fn operator_address(host: &str, local: bool) -> Result<String, String> {
     }
 }
 
+/// The SSP's Spark identity public key, creating the mnemonic the way `connect`
+/// does. Operators list it in SSP_INTERNAL_ALLOWED_IDENTITIES, so a deployment
+/// needs it before the operators (and this SSP) start.
+pub fn identity_pubkey(config: &Config) -> Result<String, String> {
+    let network = parse_network(&config.network)?;
+    let mnemonic =
+        load_or_create_mnemonic(&config.spark_mnemonic_file, config.spark_mnemonic_required)?;
+    let account = spark_account_number(network, config.spark_account_number);
+    ::spark::signer::identity_public_key(&mnemonic.to_seed(""), network, Some(account))
+        .map(|key| key.to_string())
+        .map_err(|e| e.to_string())
+}
+
 fn load_or_create_mnemonic(path: &str, required: bool) -> Result<Mnemonic, String> {
     match std::fs::read_to_string(path) {
         Ok(value) => {

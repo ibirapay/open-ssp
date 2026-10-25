@@ -395,6 +395,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if std::env::args().nth(1).as_deref() == Some("healthcheck") {
         return binary_healthcheck().await;
     }
+    if std::env::args().nth(1).as_deref() == Some("identity") {
+        println!("{}", spark::identity_pubkey(&Config::from_env()?)?);
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();

@@ -1,10 +1,11 @@
 [submodule "vendor/spark"]
 	path = vendor/spark
-	url = https://github.com/benthecarman/spark.git
-	branch = open-ssp
+	url = https://github.com/ibirapay/spark.git
+	branch = sp-4089
 [submodule "vendor/ldk-server"]
 	path = vendor/ldk-server
 	url = https://github.com/lightningdevkit/ldk-server.git
 [submodule "vendor/breez-sdk"]
 	path = vendor/breez-sdk
-	url = https://github.com/benthecarman/spark-sdk
+	url = https://github.com/ibirapay/spark-sdk
+	branch = ibirapay-port

@@ -97,7 +97,10 @@ pub async fn run(
             })
             .await?;
         ensure!(
-            submitted.payment.is_none(),
+            matches!(
+                submitted.outcome,
+                breez_sdk_spark::ClaimDepositOutcome::Submitted
+            ),
             "instant claim should settle asynchronously"
         );
         let claim = wallet

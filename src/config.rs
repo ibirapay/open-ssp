@@ -29,8 +29,10 @@ pub struct Config {
     pub ldk_node_seed_required: bool,
     /// Live LDK backend (host:port WITHOUT scheme, e.g. "ldk-server:3536").
     pub ldk_grpc_addr: String,
-    pub ldk_api_key: String,
-    pub ldk_api_key_file: String,
+    /// Hex `ldk-server` macaroon, or a file holding it (ldk-server writes
+    /// `<network_dir>/macaroons/admin.macaroon`).
+    pub ldk_macaroon: String,
+    pub ldk_macaroon_file: String,
     pub ldk_tls_cert_file: String,
     pub fee_flat_sats_swap: u64,
     /// Public URL used by the embedded wallet for SSP GraphQL calls.
@@ -40,6 +42,9 @@ pub struct Config {
     /// Refuse to create a new mnemonic when the configured file is absent.
     /// Production enables this to prevent an accidental identity change.
     pub spark_mnemonic_required: bool,
+    /// BIP32 account the Spark keys derive under. Unset keeps the account the
+    /// SSP has always used, whatever the SDK's default for the network.
+    pub spark_account_number: Option<u32>,
     /// Custom operator endpoints and identities, in the same order.
     pub so_hosts: String,
     pub so_identity_pubkeys: String,
@@ -111,8 +116,8 @@ impl Config {
             ldk_node_listen_addr: get("LDK_NODE_LISTEN_ADDR", "0.0.0.0:9735"),
             ldk_node_seed_required: parsed("LDK_NODE_SEED_REQUIRED", false)?,
             ldk_grpc_addr: get("LDK_GRPC_ADDR", ""),
-            ldk_api_key: get("LDK_API_KEY", ""),
-            ldk_api_key_file: get("LDK_API_KEY_FILE", ""),
+            ldk_macaroon: get("LDK_MACAROON", ""),
+            ldk_macaroon_file: get("LDK_MACAROON_FILE", ""),
             ldk_tls_cert_file: get("LDK_TLS_CERT_FILE", ""),
             fee_flat_sats_swap: parsed("SSP_SWAP_FEE_SATS", 0)?,
             ssp_public_url: get("SSP_PUBLIC_URL", "http://127.0.0.1:5000")
@@ -125,6 +130,14 @@ impl Config {
                     .as_str(),
                 "1" | "true" | "yes"
             ),
+            spark_account_number: match get("SSP_ACCOUNT_NUMBER", "").as_str() {
+                "" => None,
+                value => Some(
+                    value
+                        .parse()
+                        .map_err(|e| format!("SSP_ACCOUNT_NUMBER: {e}"))?,
+                ),
+            },
             so_hosts: get("SO_HOSTS", ""),
             so_identity_pubkeys: get("SO_IDENTITY_PUBKEYS", ""),
             so_cert_files: get("SO_CERT_FILES", ""),

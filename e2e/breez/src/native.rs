@@ -566,7 +566,25 @@ impl Runtime {
                 &format!("127.0.0.1:{}", optional_env("BITCOIN_RPC_PORT", "8332")),
             )
             .replace("bitcoind:28332", "127.0.0.1:28332");
+        let config = if prod_shape() { production_shaped(&config)? } else { config };
         fs::write(self.data("operator.yaml"), config)?;
+        // Enforced authz admits only listed SSPs to the SSP-internal service, so their
+        // identities must exist before the operators start.
+        let mut ssp_identities = Vec::new();
+        if prod_shape() {
+            for ssp_name in ["ssp", "ssp-2"] {
+                fs::create_dir_all(self.data(ssp_name))?;
+                let mnemonic = self.data(ssp_name).join("spark.mnemonic");
+                let identity = tools::output(
+                    Command::new(self.root.join("target/debug/open-ssp"))
+                        .arg("identity")
+                        .env("SSP_NETWORK", "REGTEST")
+                        .env("SPARK_MNEMONIC_FILE", &mnemonic),
+                )
+                .await?;
+                ssp_identities.push(identity.trim().to_string());
+            }
+        }
         let socket_dir = self.root.join(".regtest/native-sockets").join(
             &hex::encode(Sha256::digest(
                 self.directory.as_os_str().as_encoded_bytes(),
@@ -667,10 +685,22 @@ impl Runtime {
                         .to_string(),
                     "-ssp-grpc-port".into(),
                     (18535 + i).to_string(),
-                    "-local".into(),
-                    "true".into(),
-                ],
-                empty.clone(),
+                ]
+                .into_iter()
+                .chain(if prod_shape() {
+                    vec!["-static-knobs".into(), "-supported-networks".into(), "regtest".into()]
+                } else {
+                    vec!["-local".into(), "true".into()]
+                })
+                .collect(),
+                if prod_shape() {
+                    BTreeMap::from([(
+                        "SSP_INTERNAL_ALLOWED_IDENTITIES".into(),
+                        ssp_identities.join(","),
+                    )])
+                } else {
+                    empty.clone()
+                },
             )?;
             self.start(&name).await?;
         }
@@ -811,6 +841,41 @@ impl Runtime {
         self.start("bitcoin-miner").await?;
         Ok(())
     }
+}
+
+
+/// OPEN_SSP_PROD_SHAPE=1 runs the operators as a production deployment would:
+/// no -local (no MockService, all startup tasks), knobs via -static-knobs,
+/// enforced authz with an IP allowlist and the SSP identity allowlist.
+fn prod_shape() -> bool {
+    optional_env("OPEN_SSP_PROD_SHAPE", "") == "1"
+}
+
+fn production_shaped(config: &str) -> Result<String> {
+    let mut config = config.to_string();
+    for (from, to) in [
+        (
+            "  mode: 1 # AuthzModeDisabled\n  ip_allowlist: []",
+            "  mode: 2 # AuthzModeEnforced\n  ip_allowlist: [\"127.0.0.1\"]",
+        ),
+        ("return_detailed_errors: true", "return_detailed_errors: false"),
+        (
+            "return_detailed_panic_errors: true",
+            "return_detailed_panic_errors: false",
+        ),
+        (
+            // the bitcoind block; lrc20's regtest block starts with disablerpcs
+            "  regtest:\n    network: regtest\n",
+            "  regtest:\n    network: regtest\n    deposit_confirmation_threshold: 3\n",
+        ),
+    ] {
+        ensure!(
+            config.matches(from).count() == 1,
+            "operator config: expected exactly one {from:?}"
+        );
+        config = config.replace(from, to);
+    }
+    Ok(config)
 }
 
 #[cfg(test)]

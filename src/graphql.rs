@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::{auth, AppState, GraphqlRequest};
+use crate::{auth, ldk::InvoiceDescription, AppState, GraphqlRequest};
 
 /// Dispatch a GraphQL document to the matching SSP resolver.
 /// Operation names mirror spark-sdk `SspClient` methods (client.ts) and the
@@ -235,6 +235,7 @@ pub async fn dispatch(
             let quote_transfer_id =
                 crate::quotes::validate(&state, &owner, &receiver, &hash, amount, &input).await?;
             let memo = str_of(&input, "memo");
+            let description = receive_description(&input)?;
             let expiry = u32::try_from(opt_num(&input, "expiry_secs").unwrap_or(86_400))
                 .map_err(|_| "expiry_secs is out of range".to_string())?;
             if expiry == 0 {
@@ -244,7 +245,7 @@ pub async fn dispatch(
                 (chrono::Utc::now() + chrono::Duration::seconds(expiry as i64)).to_rfc3339();
             let inv = state
                 .ldk
-                .create_invoice(amount, &hash, &memo, expiry)
+                .create_invoice(amount, &hash, &description, expiry)
                 .await
                 .map_err(|e| format!("ldk create_invoice: {e}"))?;
             let rec = store_request(
@@ -968,6 +969,11 @@ async fn store_request(
     }))
 }
 
+/// The description a `request_lightning_receive` input asks for: its `memo`, or the `description_hash` a LNURL-pay invoice must commit to.
+fn receive_description(input: &Value) -> Result<InvoiceDescription, String> {
+    InvoiceDescription::from_request(&str_of(input, "memo"), &str_of(input, "description_hash"))
+}
+
 fn str_of(v: &Value, k: &str) -> String {
     match v.get(k) {
         Some(Value::String(value)) => value.clone(),
@@ -1041,10 +1047,45 @@ fn ids_of(input: &Value, root: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_query_aliases, currency_amount, str_of, transfer_response, validate_network_name,
-        validate_sats,
+        apply_query_aliases, currency_amount, receive_description, str_of, transfer_response,
+        validate_network_name, validate_sats,
     };
+    use crate::ldk::InvoiceDescription;
     use serde_json::json;
+
+    #[test]
+    fn a_receive_input_with_a_description_hash_asks_for_that_hash() -> Result<(), String> {
+        // The input as the Spark SDK sends it for a LNURL-pay invoice: memo null, description_hash set.
+        let hash = "51b3e2e77afba0a089d18b022e08730987ed2f3a1ac72eae6cc03841601b1b88";
+        let input = json!({"amount_sats": 330, "memo": null, "description_hash": hash});
+        let mut expected = [0u8; 32];
+        hex::decode_to_slice(hash, &mut expected).map_err(|e| e.to_string())?;
+        assert_eq!(
+            receive_description(&input)?,
+            InvoiceDescription::Hash(expected)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_receive_input_without_a_hash_keeps_its_memo() -> Result<(), String> {
+        assert_eq!(
+            receive_description(&json!({"memo": "hello"}))?,
+            InvoiceDescription::Memo("hello".to_string())
+        );
+        assert_eq!(
+            receive_description(&json!({"memo": null}))?,
+            InvoiceDescription::Memo(String::new())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_receive_input_with_both_a_memo_and_a_hash_is_refused() {
+        let hash = "51b3e2e77afba0a089d18b022e08730987ed2f3a1ac72eae6cc03841601b1b88";
+        assert!(receive_description(&json!({"memo": "x", "description_hash": hash})).is_err());
+        assert!(receive_description(&json!({"description_hash": "not hex"})).is_err());
+    }
 
     #[test]
     fn string_input_does_not_turn_null_into_text() {

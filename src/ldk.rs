@@ -1321,6 +1321,11 @@ fn description_of(memo: &str) -> Option<Bolt11InvoiceDescription> {
 }
 
 impl LdkBackend {
+    /// Lightning outbound sats over the usable channels (rounded down), for the liquidity reserve in gate.rs.
+    pub async fn outbound_capacity_sats(&self) -> Result<u64, String> {
+        Ok(self.client.outbound_capacity_msat().await? / 1000)
+    }
+
     // Decision: 0 fee.
     pub async fn fee_estimate_msat(&self, _invoice: &str, _amount_sats: Option<u64>) -> u64 {
         0

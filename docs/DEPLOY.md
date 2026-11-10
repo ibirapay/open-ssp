@@ -53,6 +53,9 @@ The SSP calls existing operator consensus code through this RPC.
 | `SSP_INSTANT_MAX_OUTSTANDING_SATS` | Maximum pending instant credit; default `0` disables new advances |
 | `SSP_INSTANT_MAX_DEPOSIT_SATS` | Maximum Bitcoin value per instant deposit; default `0` disables new advances |
 | `MAX_SWAP_TOTAL_SATS` | Maximum value accepted by one swap; `0` removes the cap |
+| `SSP_RESERVE_SATS` | Liquidity reserve: below this much usable Lightning outbound capacity (summed over usable channels, read at most every 10 s) the SSP refuses `lightning_send_fee_estimate` with `LIQUIDITY_RESERVED` for wallets outside the priority set. Default `0` is off. If the capacity cannot be read the send is accepted |
+| `SSP_ENTITLEMENTS_URL` | Feed that lists the priority wallets (`GET`, answers `{"identities": ["<66 hex>", ...]}`), polled every 30 s; a failed poll keeps the last list. Empty means nobody has priority |
+| `SSP_ENTITLEMENTS_TOKEN_FILE` | File with the feed's bearer token; required when the URL is set (the SSP will not start without it) |
 | `SSP_CORS_ORIGINS` | Optional comma-separated browser origins |
 | `RUST_LOG` | Optional tracing filter; use `info` unless more detail is needed |
 

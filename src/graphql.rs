@@ -65,6 +65,13 @@ pub async fn dispatch(
         "LightningSendFeeEstimate" | "lightning_send_fee_estimate" => {
             let inv = str_of(&input, "encoded_invoice");
             let amt = opt_num(&input, "amount_sats");
+            // Liquidity reserve: refuse here, before any funds move. The session is optional (this estimate never needed one); no
+            // session counts as outside the priority set.
+            let owner = auth::require_session(&state, headers).await.ok();
+            state
+                .gate
+                .check(owner.as_deref(), || state.ldk.outbound_capacity_sats())
+                .await?;
             let msat = state.ldk.fee_estimate_msat(&inv, amt).await;
             Ok(json!({ "lightning_send_fee_estimate": {
                 "fee_estimate": {

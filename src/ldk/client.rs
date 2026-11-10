@@ -251,6 +251,33 @@ impl LdkClient {
         }
     }
 
+    /// Spendable Lightning outbound over the usable channels, in msat (the liquidity reserve compares this with its floor).
+    pub async fn outbound_capacity_msat(&self) -> Result<u64, String> {
+        match self {
+            Self::Server(client) => {
+                let channels = client
+                    .list_channels(ListChannelsRequest {})
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .channels;
+                Ok(channels
+                    .iter()
+                    .filter(|c| c.is_usable)
+                    .fold(0u64, |sum, c| sum.saturating_add(c.outbound_capacity_msat)))
+            }
+            Self::Embedded(node) => {
+                node.call(|node| {
+                    Ok(node
+                        .list_channels()
+                        .iter()
+                        .filter(|c| c.is_usable)
+                        .fold(0u64, |sum, c| sum.saturating_add(c.outbound_capacity_msat)))
+                })
+                .await
+            }
+        }
+    }
+
     pub async fn stop(&self) -> Result<(), String> {
         match self {
             Self::Server(_) => Ok(()),

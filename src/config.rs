@@ -71,6 +71,11 @@ pub struct Config {
     /// Zero disables new advances; pending recoveries still run.
     pub instant_max_outstanding_sats: u64,
     pub instant_max_deposit_sats: u64,
+    /// Outbound Lightning sats below which sends from wallets outside the priority set are refused (see gate.rs). 0 = off.
+    pub ssp_reserve_sats: u64,
+    /// Entitlements feed (signup service) that lists the priority wallets, and the file holding its bearer token. Empty URL = no priority set.
+    pub ssp_entitlements_url: String,
+    pub ssp_entitlements_token_file: String,
 }
 
 fn parsed<T: std::str::FromStr>(key: &str, default: T) -> Result<T, String>
@@ -153,6 +158,9 @@ impl Config {
             max_swap_total_sats: parsed("MAX_SWAP_TOTAL_SATS", 1_000_000)?,
             instant_max_outstanding_sats: parsed("SSP_INSTANT_MAX_OUTSTANDING_SATS", 0)?,
             instant_max_deposit_sats: parsed("SSP_INSTANT_MAX_DEPOSIT_SATS", 0)?,
+            ssp_reserve_sats: parsed("SSP_RESERVE_SATS", 0)?,
+            ssp_entitlements_url: get("SSP_ENTITLEMENTS_URL", "").trim().to_string(),
+            ssp_entitlements_token_file: get("SSP_ENTITLEMENTS_TOKEN_FILE", ""),
         })
     }
 }

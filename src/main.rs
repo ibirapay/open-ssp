@@ -17,6 +17,7 @@ mod config;
 mod coop_exit;
 mod db;
 mod fs;
+mod gate;
 mod graphql;
 mod history;
 mod instant_deposits;
@@ -44,6 +45,8 @@ pub struct AppState {
     pub static_deposit: Option<Arc<static_deposits::StaticDepositService>>,
     /// Serializes the check-and-pay section for idempotent Lightning sends.
     pub send_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Liquidity reserve for Free-plan Lightning sends (gate.rs).
+    pub gate: Arc<gate::Gate>,
 }
 
 pub async fn ssp_identity(state: &AppState) -> Result<String, String> {
@@ -463,6 +466,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(service) = coop_exit.clone() {
         tokio::spawn(service.run());
     }
+    let gate = Arc::new(gate::Gate::new(config.ssp_reserve_sats));
+    if config.ssp_entitlements_url.is_empty() {
+        if config.ssp_reserve_sats > 0 {
+            tracing::warn!(
+                "SSP_RESERVE_SATS is set but SSP_ENTITLEMENTS_URL is empty: no wallet has priority"
+            );
+        }
+    } else {
+        // A bad token file is a deploy mistake: fail loudly at boot instead of running with an empty priority list.
+        let token = std::fs::read_to_string(&config.ssp_entitlements_token_file)
+            .map_err(|e| format!("SSP_ENTITLEMENTS_TOKEN_FILE: {e}"))?
+            .trim()
+            .to_string();
+        if token.is_empty() {
+            return Err("SSP_ENTITLEMENTS_TOKEN_FILE is empty".into());
+        }
+        gate::spawn_poller(gate.clone(), config.ssp_entitlements_url.clone(), token);
+    }
+    info!("liquidity reserve: {} sats (0 = off)", gate.reserve_sats());
     let state = AppState {
         config: config.clone(),
         db,
@@ -471,6 +493,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         coop_exit,
         static_deposit,
         send_lock: Arc::new(tokio::sync::Mutex::new(())),
+        gate,
     };
     info!("SSP listening on {} (network={})", addr, config.network);
     let app = Router::new()

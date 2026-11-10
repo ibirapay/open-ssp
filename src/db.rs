@@ -60,6 +60,31 @@ pub(crate) fn ensure_column(
     Ok(())
 }
 
+/// Billing input: remember that this wallet identity was seen this UTC month (one row per identity per month). Called on every authenticated
+/// request and at login: it reads first and writes only the first time in the month. Sessions are pruned after 24 h and carry no creation
+/// time, so "who was active in month M" cannot be asked afterwards; it has to be written when it happens.
+fn note_activity(c: &rusqlite::Connection, identity: &str) -> rusqlite::Result<()> {
+    let seen: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM activity WHERE month=strftime('%Y-%m','now') AND identity=lower(?1))",
+        [identity],
+        |r| r.get(0),
+    )?;
+    if !seen {
+        c.execute(
+            "INSERT OR IGNORE INTO activity(month,identity) VALUES(strftime('%Y-%m','now'),lower(?1))",
+            [identity],
+        )?;
+    }
+    Ok(())
+}
+
+/// The count is bookkeeping: if it cannot be written (disk full, busy) the login or request still works and the miss is logged.
+fn log_activity(c: &rusqlite::Connection, identity: &str) {
+    if let Err(e) = note_activity(c, identity) {
+        tracing::warn!("activity not recorded: {e}");
+    }
+}
+
 fn migrate_challenges(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let primary_columns: u32 = conn.query_row(
         "SELECT count(*) FROM pragma_table_info('challenges') WHERE pk>0",
@@ -100,6 +125,7 @@ impl Db {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS challenges(identity TEXT NOT NULL, protected TEXT NOT NULL, issued_at TEXT NOT NULL, PRIMARY KEY(identity,protected));
              CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, identity TEXT NOT NULL, valid_until TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS activity(month TEXT NOT NULL, identity TEXT NOT NULL, PRIMARY KEY(month,identity)) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, kind TEXT NOT NULL, owner TEXT NOT NULL, created_at TEXT NOT NULL, payload TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS transfers(spark_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, status TEXT NOT NULL);
@@ -214,6 +240,17 @@ impl Db {
         })
     }
 
+    /// Identities seen in `month` (`YYYY-MM`, UTC), sorted; only 66-character (compressed) keys: a login also accepts other key encodings, which cannot match a registered wallet.
+    pub async fn activity_in(&self, month: &str) -> Result<Vec<String>, String> {
+        self.with(|c| {
+            let mut stmt =
+                c.prepare("SELECT identity FROM activity WHERE month=?1 AND length(identity)=66 ORDER BY identity")?;
+            let rows = stmt.query_map([month], |r| r.get::<_, String>(0))?;
+            rows.collect()
+        })
+        .await
+    }
+
     // ---- challenges (single-use, 5-minute expiry) ----
     pub async fn save_challenge(
         &self,
@@ -285,11 +322,13 @@ impl Db {
         valid_until: &str,
     ) -> Result<(), String> {
         self.with(|c| {
-            c.execute(
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
                 "INSERT INTO sessions(token,identity,valid_until) VALUES(?1,?2,?3)",
                 (token, identity, valid_until),
-            )
-            .map(|_| ())
+            )?;
+            log_activity(&tx, identity);
+            tx.commit()
         })
         .await
     }
@@ -300,16 +339,21 @@ impl Db {
         now_rfc3339: &str,
     ) -> Result<Option<String>, String> {
         self.with(|c| {
-            c.query_row(
-                "SELECT identity FROM sessions WHERE token=?1 AND valid_until>?2",
-                (token, now_rfc3339),
-                |r| r.get(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                e => Err(e),
-            })
+            let owner = c
+                .query_row(
+                    "SELECT identity FROM sessions WHERE token=?1 AND valid_until>?2",
+                    (token, now_rfc3339),
+                    |r| r.get::<_, String>(0),
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(e),
+                })?;
+            if let Some(owner) = &owner {
+                log_activity(c, owner);
+            }
+            Ok(owner)
         })
         .await
     }
@@ -2090,6 +2134,56 @@ mod tests {
                 .unwrap(),
             Some(vec![vec![9], vec![10]])
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn login_and_every_authenticated_use_leave_one_activity_row_per_identity_and_month() {
+        let (db, dir) = test_db();
+        // 66-character compressed keys, as a real wallet presents
+        let id = |tail: &str| format!("02{}{}", "0".repeat(64 - tail.len()), tail);
+        let month = chrono::Utc::now().format("%Y-%m").to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let later = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+        assert!(db.activity_in(&month).await.unwrap().is_empty());
+        db.save_session("t1", &id("AA"), &later).await.unwrap();
+        db.save_session("t2", &id("aa"), &later).await.unwrap(); // same wallet, again, other case
+        db.save_session("t3", &id("bb"), &later).await.unwrap();
+        // pruned sessions leave their rows behind; using a session records too (a wallet logged in last month and only reads now); an unknown or expired token records nothing
+        db.prune_expired_sessions("2999-01-01T00:00:00+00:00")
+            .await
+            .unwrap();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO sessions(token,identity,valid_until) VALUES('t4',?1,?2)",
+                (id("CC"), &later),
+            )
+            .map(|_| ())
+        })
+        .await
+        .unwrap(); // a session that never went through save_session (older than this code)
+        assert_eq!(
+            db.session_owner("t4", &now).await.unwrap().as_deref(),
+            Some(id("CC").as_str())
+        );
+        assert_eq!(db.session_owner("nope", &now).await.unwrap(), None);
+        assert_eq!(
+            db.session_owner("t4", "2999-01-01T00:00:00+00:00")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.activity_in(&month).await.unwrap(),
+            vec![id("aa"), id("bb"), id("cc")]
+        );
+        // the row outlives the pruned session; other months stay empty
+        assert!(db.activity_in("2020-01").await.unwrap().is_empty());
+        // a login also accepts other key encodings (65-byte uncompressed): they are kept out of the list
+        db.save_session("t5", &format!("04{}", "a".repeat(128)), &later)
+            .await
+            .unwrap();
+        assert_eq!(db.activity_in(&month).await.unwrap().len(), 3);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

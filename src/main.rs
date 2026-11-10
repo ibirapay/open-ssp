@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -200,6 +200,53 @@ async fn settlements(State(state): State<AppState>, headers: HeaderMap) -> impl 
         ),
     }
 }
+#[derive(Deserialize)]
+struct ActivityQuery {
+    month: String,
+}
+
+/// `YYYY-MM` with a real month number.
+fn valid_month(m: &str) -> bool {
+    let b = m.as_bytes();
+    b.len() == 7
+        && b[4] == b'-'
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && matches!(
+            &m[5..],
+            "01" | "02" | "03" | "04" | "05" | "06" | "07" | "08" | "09" | "10" | "11" | "12"
+        )
+}
+
+/// Billing input for IBIRAPAY's signup service: the wallet identities seen in a UTC month (a session or a request).
+async fn activity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ActivityQuery>,
+) -> impl IntoResponse {
+    if !admin_authorized(&state.config, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        );
+    }
+    if !valid_month(&q.month) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "month must be YYYY-MM"})),
+        );
+    }
+    match state.db.activity_in(&q.month).await {
+        Ok(ids) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"month": q.month, "identities": ids})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error})),
+        ),
+    }
+}
+
 #[derive(Deserialize)]
 struct ReconcileRequest {
     request_id: String,
@@ -502,6 +549,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/identity", get(identity_handler))
         .route("/status", get(status))
         .route("/admin/settlements", get(settlements))
+        .route("/admin/activity", get(activity))
         .route("/admin/settlements/reconcile", post(reconcile_settlement))
         .route("/admin/spark/deposit-address", post(spark_deposit_address))
         .route("/admin/spark/claim-deposit", post(spark_claim_deposit))
@@ -600,6 +648,26 @@ async fn binary_healthcheck() -> Result<(), Box<dyn std::error::Error + Send + S
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn the_activity_month_is_yyyy_mm_with_a_real_month() {
+        for ok in ["2026-11", "2026-01", "2026-12"] {
+            assert!(valid_month(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "2026-13",
+            "2026-00",
+            "2026-1",
+            "26-11",
+            "2026/11",
+            "2026-11-01",
+            "20x6-11",
+            "2026-1é",
+        ] {
+            assert!(!valid_month(bad), "{bad}");
+        }
+    }
 
     #[tokio::test]
     async fn health_only_reports_status() {

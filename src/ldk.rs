@@ -1295,6 +1295,7 @@ fn validate_created_invoice(
     payment_hash: &str,
     amount_sats: u64,
     network: bitcoin::Network,
+    description: &InvoiceDescription,
 ) -> Result<(), String> {
     let invoice = lightning_invoice::Bolt11Invoice::from_str(invoice)
         .map_err(|e| format!("decode created BOLT11 invoice: {e}"))?;
@@ -1307,6 +1308,18 @@ fn validate_created_invoice(
     if invoice.network() != network {
         return Err("created invoice network does not match the SSP network".to_string());
     }
+    if let InvoiceDescription::Hash(expected) = description {
+        use bitcoin::hashes::Hash as _;
+        let committed = matches!(
+            invoice.description(),
+            lightning_invoice::Bolt11InvoiceDescriptionRef::Hash(h) if h.0.to_byte_array() == *expected
+        );
+        if !committed {
+            return Err(
+                "created invoice description hash does not match the requested hash".to_string(),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1318,6 +1331,41 @@ fn description_of(memo: &str) -> Option<Bolt11InvoiceDescription> {
     Some(Bolt11InvoiceDescription {
         kind: Some(Kind::Direct(memo.to_string())),
     })
+}
+
+/// What a receive invoice's description commits to. A LNURL-pay invoice has to commit to the hash of its
+/// metadata (the `h` tag), so a memo and a description hash exclude each other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvoiceDescription {
+    Memo(String),
+    Hash([u8; 32]),
+}
+
+impl InvoiceDescription {
+    /// The description a `request_lightning_receive` input asks for. An empty `description_hash` means none.
+    pub fn from_request(memo: &str, description_hash: &str) -> Result<Self, String> {
+        if description_hash.is_empty() {
+            return Ok(Self::Memo(memo.to_string()));
+        }
+        if !memo.is_empty() {
+            return Err("memo and description_hash are mutually exclusive".to_string());
+        }
+        let bytes = hex::decode(description_hash)
+            .map_err(|e| format!("description_hash is not hex: {e}"))?;
+        let hash = <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| "description_hash must be 32 bytes".to_string())?;
+        Ok(Self::Hash(hash))
+    }
+
+    fn to_proto(&self) -> Option<Bolt11InvoiceDescription> {
+        use ldk_server_client::ldk_server_grpc::types::bolt11_invoice_description::Kind;
+        match self {
+            Self::Memo(memo) => description_of(memo),
+            Self::Hash(hash) => Some(Bolt11InvoiceDescription {
+                kind: Some(Kind::Hash(hex::encode(hash))),
+            }),
+        }
+    }
 }
 
 impl LdkBackend {
@@ -1466,12 +1514,12 @@ impl LdkBackend {
         &self,
         amount_sats: u64,
         payment_hash_hex: &str,
-        memo: &str,
+        description: &InvoiceDescription,
         expiry_secs: u32,
     ) -> Result<CreateInvoiceResult, String> {
         let request = Bolt11ReceiveForHashRequest {
             amount_msat: Some(sats_to_msats(amount_sats)?),
-            description: description_of(memo),
+            description: description.to_proto(),
             expiry_secs,
             payment_hash: payment_hash_hex.to_string(),
         };
@@ -1493,6 +1541,7 @@ impl LdkBackend {
             payment_hash_hex,
             amount_sats,
             self.invoice_network,
+            description,
         )?;
         Ok(CreateInvoiceResult {
             invoice: resp.invoice,
@@ -2484,5 +2533,111 @@ mod tests {
         assert_eq!(ldk.failed_holds.load(Ordering::SeqCst), 1);
         assert_eq!(db.receive_status(&hash).await.unwrap(), "HTLC_FAILED");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod invoice_description_tests {
+    use super::*;
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use ldk_server_client::ldk_server_grpc::types::bolt11_invoice_description::Kind;
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+
+    const HASH: [u8; 32] = [7u8; 32];
+    const OTHER: [u8; 32] = [9u8; 32];
+    const PAYMENT_HASH: [u8; 32] = [3u8; 32];
+
+    fn signed_invoice(description_hash: Option<[u8; 32]>) -> Result<String, String> {
+        let key = SecretKey::from_slice(&[1u8; 32]).map_err(|e| e.to_string())?;
+        let base = InvoiceBuilder::new(Currency::Bitcoin);
+        let base = match description_hash {
+            Some(h) => base.description_hash(sha256::Hash::from_byte_array(h)),
+            None => base.description(String::new()),
+        };
+        base.payment_hash(sha256::Hash::from_byte_array(PAYMENT_HASH))
+            .payment_secret(PaymentSecret([2u8; 32]))
+            .amount_milli_satoshis(330_000)
+            .duration_since_epoch(Duration::from_secs(1_700_000_000))
+            .min_final_cltv_expiry_delta(144)
+            .build_signed(|m| Secp256k1::new().sign_ecdsa_recoverable(m, &key))
+            .map(|i| i.to_string())
+            .map_err(|e| e.to_string())
+    }
+
+    fn check(invoice: &str, description: &InvoiceDescription) -> Result<(), String> {
+        validate_created_invoice(
+            invoice,
+            &hex::encode(PAYMENT_HASH),
+            330,
+            bitcoin::Network::Bitcoin,
+            description,
+        )
+    }
+
+    #[test]
+    fn from_request_reads_memo_hash_or_neither() -> Result<(), String> {
+        assert_eq!(
+            InvoiceDescription::from_request("", "")?,
+            InvoiceDescription::Memo(String::new())
+        );
+        assert_eq!(
+            InvoiceDescription::from_request("hello", "")?,
+            InvoiceDescription::Memo("hello".to_string())
+        );
+        assert_eq!(
+            InvoiceDescription::from_request("", &hex::encode(HASH))?,
+            InvoiceDescription::Hash(HASH)
+        );
+        assert_eq!(
+            InvoiceDescription::from_request("", &hex::encode(HASH).to_uppercase())?,
+            InvoiceDescription::Hash(HASH)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn from_request_refuses_memo_with_hash_and_malformed_hashes() {
+        assert!(InvoiceDescription::from_request("hello", &hex::encode(HASH)).is_err());
+        assert!(InvoiceDescription::from_request("", "zz").is_err());
+        assert!(InvoiceDescription::from_request("", &hex::encode([7u8; 31])).is_err());
+        assert!(InvoiceDescription::from_request("", &hex::encode([7u8; 33])).is_err());
+    }
+
+    #[test]
+    fn a_hash_description_reaches_the_node_as_a_hash() {
+        let proto = InvoiceDescription::Hash(HASH).to_proto();
+        assert_eq!(
+            proto.and_then(|d| d.kind),
+            Some(Kind::Hash(hex::encode(HASH)))
+        );
+    }
+
+    #[test]
+    fn a_memo_description_still_reaches_the_node_as_before() {
+        assert_eq!(InvoiceDescription::Memo(String::new()).to_proto(), None);
+        assert_eq!(
+            InvoiceDescription::Memo("hi".to_string())
+                .to_proto()
+                .and_then(|d| d.kind),
+            Some(Kind::Direct("hi".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_created_invoice_must_carry_the_requested_description_hash() -> Result<(), String> {
+        let wanted = InvoiceDescription::Hash(HASH);
+        assert!(check(&signed_invoice(Some(HASH))?, &wanted).is_ok());
+        // The bug this guards: the node made an invoice with an empty description.
+        assert!(check(&signed_invoice(None)?, &wanted).is_err());
+        assert!(check(&signed_invoice(Some(OTHER))?, &wanted).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_memo_request_is_not_held_to_a_hash() -> Result<(), String> {
+        let memo = InvoiceDescription::Memo(String::new());
+        assert!(check(&signed_invoice(None)?, &memo).is_ok());
+        Ok(())
     }
 }

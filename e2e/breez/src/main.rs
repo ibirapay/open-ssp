@@ -2128,6 +2128,224 @@ async fn history_pages(wallet: &Wallet, other: &Wallet) -> Result<()> {
     Ok(())
 }
 
+// One wallet, many devices: IBIRAPAY PDV shops run several tills on ONE 12-word wallet, so several SDK
+// instances operate the same node at once. This exercises that shape end to end: same seed, two clients,
+// concurrent receives (both must claim and converge), concurrent outbound sends (leaf contention must
+// self-heal through the SDK's refresh-and-retry), and one balance visible to both.
+async fn dual_till(config: TestConfig, ldk_a: LdkClient, ldk_b: LdkClient) -> Result<()> {
+    async fn pay_external(wallet: &Wallet, invoice: &str) -> Result<String> {
+        let prepared = wallet
+            .sdk
+            .prepare_send_payment(PrepareSendPaymentRequest {
+                payment_request: PaymentRequest::Input {
+                    input: invoice.to_string(),
+                },
+                amount: None,
+                token_identifier: None,
+                conversion_options: None,
+                fee_policy: None,
+            })
+            .await
+            .with_context(|| format!("{} send preparation failed", wallet.name))?;
+        let sent = wallet
+            .sdk
+            .send_payment(SendPaymentRequest {
+                prepare_response: prepared,
+                options: None,
+                idempotency_key: None,
+            })
+            .await
+            .with_context(|| format!("{} send execution failed", wallet.name))?;
+        Ok(sent.payment.id)
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .context("could not build HTTP client")?;
+    let ssp = "http://127.0.0.1:5000";
+    ensure!(
+        config.receive_amount_sats >= 4,
+        "dual-till needs BREEZ_RECEIVE_AMOUNT_SATS >= 4 for its /2 and /4 splits"
+    );
+    // One deadline (total) bounds funding + connections + the workload; each disconnect gets
+    // its own bound so cleanup always runs. Requires a freshly reset stack: the fixed seed
+    // and absolute balances would see the previous run's sats otherwise.
+    let total = config.timeout * 10;
+    let started = tokio::time::Instant::now();
+    let deadline = started + total;
+    let received_total = config.receive_amount_sats + config.receive_amount_sats / 2;
+
+    let (till_a, till_b) = match tokio::time::timeout_at(deadline, async {
+        // Fund the scenario itself: the SSP float must cover both receives with margin,
+        // whatever the earlier scenarios left behind.
+        if ssp_available_balance(&client, &config, ssp).await? < received_total * 2 {
+            fund_ssp(&client, &config, ssp, received_total * 2).await?;
+        }
+        let till_a = connect_wallet(&client, &config, "dual-a", ssp, ldk_a.clone(), 0x2a).await?;
+        let till_b = match connect_wallet(&client, &config, "dual-b", ssp, ldk_a, 0x2a).await {
+            Ok(wallet) => wallet,
+            Err(error) => {
+                let _ = till_a.sdk.disconnect().await;
+                return Err(error);
+            }
+        };
+        Ok((till_a, till_b))
+    })
+    .await
+    {
+        Ok(setup) => setup?,
+        Err(_) => bail!("dual-till hung funding or connecting its wallets"),
+    };
+
+    let result = match tokio::time::timeout_at(deadline, async {
+        let mut ids = Vec::new();
+        for till in [&till_a, &till_b] {
+            ids.push(
+                till.sdk
+                    .get_info(GetInfoRequest {
+                        ensure_synced: Some(true),
+                    })
+                    .await?
+                    .identity_pubkey,
+            );
+        }
+        if ids[0] != ids[1] {
+            bail!("two tills are not the same node");
+        }
+
+        // Unequal receive denominations: both tills hold the same leaf set {R, R/2}, and every
+        // payout is below R/2, so the smallest-sufficient selection in both identical stores
+        // picks the SAME leaf — the two sends contend inside select_leaves, where a lost swap
+        // is retried by select_leaves_with_retry (3 attempts, leaves refreshed once per
+        // instance). Whether both submissions actually collide at the operator depends on
+        // interleaving; forcing that needs an SDK test hook. Both sends completing is what the
+        // assertions below prove. Production tills keep the SDK default 60s sync, so a second
+        // lost race in one session can fail a sale visibly (no funds lost) — a dashboard
+        // concern, tracked outside this test.
+        let amounts = [config.receive_amount_sats, config.receive_amount_sats / 2];
+        let mut invoices = Vec::new();
+        for (till, amount) in [(&till_a, amounts[0]), (&till_b, amounts[1])] {
+            invoices.push(
+                till.sdk
+                    .receive_payment(ReceivePaymentRequest {
+                        payment_method: ReceivePaymentMethod::Bolt11Invoice {
+                            receiver_identity_public_key: None,
+                            description: "dual-receive".to_string(),
+                            amount_sats: Some(amount),
+                            expiry_secs: Some(300),
+                            payment_hash: None,
+                        },
+                    })
+                    .await?
+                    .payment_request,
+            );
+        }
+        let (pay_a, pay_b) = (
+            ["bolt11-send", invoices[0].as_str()],
+            ["bolt11-send", invoices[1].as_str()],
+        );
+        let (sent_a, sent_b) = tokio::join!(ldk_b.json(&pay_a), ldk_b.json(&pay_b));
+        sent_a?;
+        sent_b?;
+        for (till, invoice) in [(&till_a, &invoices[0]), (&till_b, &invoices[1])] {
+            poll("dual receive", config.timeout, || {
+                received_payment(till, invoice)
+            })
+            .await?;
+        }
+        for till in [&till_a, &till_b] {
+            poll("dual balance after receives", config.timeout, || {
+                exact_balance(till, received_total)
+            })
+            .await?;
+        }
+        // Any till must be able to show every sale of the shop: both stores list both receives.
+        for (till, invoice) in [(&till_a, &invoices[1]), (&till_b, &invoices[0])] {
+            poll("dual cross-history receive", config.timeout, || {
+                received_payment(till, invoice)
+            })
+            .await?;
+        }
+
+        let payout = format!("{}sat", config.receive_amount_sats / 4);
+        let mut payouts = Vec::new();
+        for _ in 0..2 {
+            let receive = ldk_b
+                .json(&["bolt11-receive", &payout, "-d", "dual-payout"])
+                .await?;
+            payouts.push(
+                receive["invoice"]
+                    .as_str()
+                    .context("payout invoice is missing")?
+                    .to_string(),
+            );
+        }
+        let (paid_a, paid_b) = tokio::join!(
+            pay_external(&till_a, &payouts[0]),
+            pay_external(&till_b, &payouts[1])
+        );
+        let (id_a, id_b) = (paid_a?, paid_b?);
+        ensure!(id_a != id_b, "both tills returned the same payment id");
+        let payment_a = poll("dual-a external send", config.timeout, || {
+            completed_payment(&till_a, &id_a)
+        })
+        .await?;
+        let payment_b = poll("dual-b external send", config.timeout, || {
+            completed_payment(&till_b, &id_b)
+        })
+        .await?;
+        // Same for sends: each till's history must show the other till's send too.
+        poll("dual-a sees dual-b's send", config.timeout, || {
+            completed_payment(&till_a, &id_b)
+        })
+        .await?;
+        poll("dual-b sees dual-a's send", config.timeout, || {
+            completed_payment(&till_b, &id_a)
+        })
+        .await?;
+        for invoice in &payouts {
+            let hash = decode_payment_hash(&ldk_b, invoice).await?;
+            poll("dual payout settled at ldk-b", config.timeout, || {
+                succeeded_ldk_payment(&ldk_b, &hash, "INBOUND", config.receive_amount_sats / 4)
+            })
+            .await?;
+        }
+
+        // One node, one truth: both stores must independently reach the exact balance implied
+        // by the two completed payments (amount + fees each), never merely agree.
+        let spent = payment_a.amount + payment_a.fees + payment_b.amount + payment_b.fees;
+        let expected = u128::from(received_total);
+        ensure!(spent <= expected, "spent more than received: {spent}");
+        let final_balance = u64::try_from(expected - spent).context("expected balance overflow")?;
+        for till in [&till_a, &till_b] {
+            poll("dual balance after sends", config.timeout, || {
+                exact_balance(till, final_balance)
+            })
+            .await?;
+        }
+        println!("PASS dual-till: two tills, one node, concurrent receive+send");
+        Ok(())
+    })
+    .await
+    {
+        Ok(inner) => inner,
+        Err(_) => Err(anyhow::anyhow!("dual-till hung past its overall timeout")),
+    };
+
+    let disc_a = match tokio::time::timeout(config.timeout, till_a.sdk.disconnect()).await {
+        Ok(disconnected) => disconnected.map_err(anyhow::Error::from),
+        Err(_) => Err(anyhow::anyhow!("dual-a disconnect hung")),
+    };
+    let disc_b = match tokio::time::timeout(config.timeout, till_b.sdk.disconnect()).await {
+        Ok(disconnected) => disconnected.map_err(anyhow::Error::from),
+        Err(_) => Err(anyhow::anyhow!("dual-b disconnect hung")),
+    };
+    result?;
+    disc_a.context("could not disconnect dual-a")?;
+    disc_b.context("could not disconnect dual-b")
+}
+
 async fn acceptance(config: TestConfig, ldk_a: LdkClient, ldk_b: LdkClient) -> Result<()> {
     breez_sdk_spark::init_logging(
         None,

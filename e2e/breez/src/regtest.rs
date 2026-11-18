@@ -7,7 +7,8 @@ use reqwest::Client;
 use tokio::process::Command;
 
 use super::{
-    LdkClient, TestConfig, acceptance, fund_ssp, optional_env, poll, setup_lightning, timed,
+    LdkClient, TestConfig, acceptance, dual_till, fund_ssp, optional_env, poll, setup_lightning,
+    timed,
 };
 
 const HELP: &str = "Usage: cargo regtest [--project NAME] COMMAND
@@ -442,6 +443,11 @@ impl Stack {
                 ensure!(depth.parse::<u64>()? >= 2, "operator {i} did not exercise repeated splits");
             }
             println!("PASS Breez regtest acceptance and operator split checks");
+            timed(
+                "dual-till",
+                dual_till(self.config().await?, self.node("ldk-server").await?, self.node("ldk-server-2").await?),
+            )
+            .await?;
             Ok(())
         }).await;
         if result.is_err() {
